@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "thresholds": {
+    "amber": 110000,
+    "red": 160000,
+    "critical": 220000
+  },
+  "pct_of_window": {
+    "red": 0.7,
+    "critical": 0.85
+  },
+  "block_at_critical": true,
+  "big_tool_result_tokens": 25000,
+  "min_growth_bytes": 40000,
+  "share_dir": "",
+  "extra_transcript_dirs": [],
+  "clipboard": true,
+  "block_at_red": false,
+  "renotify_tokens": 25000,
+  "assume_window": 0
+}

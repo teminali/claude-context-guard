@@ -1,0 +1,165 @@
+# Context guard + handover
+
+Stops Claude Code sessions from silently growing into 300-600k-token monsters, and
+hands the work to a fresh chat without losing anything.
+
+Pure stdlib Python, one file, no dependencies.
+
+## Why
+
+Context is re-sent on every turn. A 300k-token session does not cost 300k once — it
+costs 300k *per remaining turn*. `ctx.py report` on one machine, over three days:
+
+```
+tokens re-sent as context : 1,514.9M
+turns above 150k context  : 71%
+avg context per turn      : 314k
+```
+
+Every one of those turns paid for the whole conversation again. The guard makes that
+visible while it is happening, and the handover makes stopping cheap.
+
+## Install
+
+```bash
+git clone https://github.com/teminali/claude-context-guard
+cd claude-context-guard && ./install.sh
+```
+
+Idempotent — re-run it after any `git pull`. It never overwrites your `config.json`,
+your handover docs, or your per-session state. Open `/hooks` once (or restart Claude
+Code) so the hooks load.
+
+## What gets installed
+
+| Piece | Where | Does |
+|---|---|---|
+| `bin/ctx.py` | `~/.claude/handover/` | the whole engine, stdlib-only |
+| `config.json` | `~/.claude/handover/` | thresholds, share folder, toggles |
+| `state/` | `~/.claude/handover/` | per-session band state (which warnings already fired) |
+| guard hooks | `~/.claude/settings.json` | PostToolUse + UserPromptSubmit + SessionStart |
+| status line | `~/.claude/settings.json` | live `ctx 171k [####....] 86%` readout |
+| `handover` skill | `~/.claude/skills/handover/` | `/handover` — writes the doc |
+| 2 subagents | `~/.claude/agents/` | verify and staleness-check a pickup off-context |
+
+## Bands
+
+Absolute token counts, because cost tracks absolute context, not percentage of window.
+
+| Band | Default | Behaviour |
+|---|---|---|
+| AMBER | 110k | "finish this step, open nothing new" |
+| RED | 160k | "stop new work, run /handover now" |
+| CRITICAL | 220k | blocks the tool call and forces the handover |
+
+Each band fires once per session, and re-arms if context drops (after `/clear` or a
+compaction). Edit `config.json` to retune; `enabled: false` turns the whole thing off.
+
+The window is only *known* once a session passes 200k (transcripts record
+`claude-opus-5` for both the 200k and 1M variants), so percentage trips apply only when
+it is known. Pin it with `assume_window` if you always use one model — the bands
+themselves are absolute, so pinning changes the readout, not when they fire.
+
+## Lanes: two sessions, one repo
+
+The project is not a fine enough key. Two sessions can be open on the same repo doing
+unrelated things, and handing a session the *wrong* doc is worse than handing it none —
+it executes another thread's plan with full confidence.
+
+So every handover is tagged with a **lane**: one thread of work. On a fresh session:
+
+- **One lane pending** — the doc is injected and auto-consumed. A bare `continue` picks
+  up exactly where the last session stopped. Nothing to paste.
+- **Several lanes pending** — the list is injected and *nothing* is claimed. Claude asks
+  which one. Guessing is the one unrecoverable failure, so it does not guess.
+- **A session already bound to a lane** is never offered a sibling lane's doc.
+
+Writing a handover retires only its own lane's previous doc, so concurrent sessions
+cannot silently kill each other's work.
+
+## Picking up cheaply
+
+Two subagents exist so that a fresh session does not pay, in its own context, for
+reading it will never need again. A main-context token is re-sent every turn; a
+subagent's reading is paid once.
+
+| Agent | Model | Returns |
+|---|---|---|
+| `verify-pickup` | haiku | runs the doc's `## Verification` block → `VERDICT` + the first real error, ~10 lines |
+| `handover-staleness` | sonnet | diffs `## Next steps` against git → `N of M already done`, each with a commit or `path:line` |
+
+Measured on this repo's own handover: 25.7k tokens spent inside the two agents, about
+20 lines returned. Both report; neither fixes. A `DONE` without a citation is not a
+`DONE`.
+
+## Commands
+
+```bash
+ctx=~/.claude/handover/bin/ctx.py
+python3 $ctx status              # context size and band for this session
+python3 $ctx brief               # status + facts in one call (use when writing a doc)
+python3 $ctx pickup --lane X     # print a lane's doc and claim it, one call
+python3 $ctx report --days 7     # where tokens actually went, all local sessions
+python3 $ctx savings             # what handing over right now would save
+python3 $ctx savings --all       # what the handovers already written actually saved
+python3 $ctx list                # handovers for this project, with lanes, every machine
+python3 $ctx show                # print the newest one
+python3 $ctx consume <file>      # mark one as picked up
+python3 $ctx doctor              # verify the install
+```
+
+## Does it work?
+
+`savings --all` credits a handover only when a later session actually named its doc in
+its first few turns, and credits it once. On the machine this was built on, across 47
+handovers with 33 credited pickups:
+
+```
+746.9M tokens not re-sent
+```
+
+That number assumes each avoided session would have stayed flat at its handover size.
+In practice sessions keep growing, so it is a floor, not a ceiling. On a subscription
+the currency is your usage allowance rather than dollars.
+
+## Another computer
+
+A hook only runs inside its own session, so nothing here can watch a chat on a
+different machine. What travels is the toolkit and the handover docs:
+
+```bash
+git clone https://github.com/teminali/claude-context-guard && cd claude-context-guard && ./install.sh
+```
+
+`install.sh` merges the hooks into that machine's `~/.claude/settings.json` (with a
+backup) and points it at a shared iCloud Drive folder if one exists. Handovers are
+written to the project *and* mirrored to `<share_dir>/<project>/`, tagged with the
+machine that wrote them — so machine B's SessionStart hook offers the handover machine A
+wrote. Any synced folder works: set `share_dir` in `config.json` (Dropbox, a git repo,
+an SMB share).
+
+For a repo your team or cloud sessions share, install project-scoped hooks instead:
+
+```bash
+python3 ~/.claude/handover/bin/ctx.py install --project /path/to/repo
+```
+
+That writes `<repo>/.claude/settings.json`, so anyone working in the repo gets the guard.
+
+## Privacy
+
+Everything stays on your machine. `state/` (session ids, token counts, local doc paths)
+and your live `config.json` are gitignored; handover docs are written into your own
+projects and, if you configure one, your own synced folder. Nothing is sent anywhere.
+
+## Turning it off
+
+```bash
+python3 -c "import json,pathlib;p=pathlib.Path.home()/'.claude/handover/config.json';c=json.loads(p.read_text());c['enabled']=False;p.write_text(json.dumps(c,indent=2))"
+```
+
+Or restore a settings backup: `~/.claude/settings.json.bak-*`.
+
+## License
+
+MIT

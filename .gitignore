@@ -1,0 +1,8 @@
+# Per-session band state: session ids, token counts, local doc paths.
+state/
+# The live config carries this machine's share folder. Ship the sample instead.
+config.json
+__pycache__/
+*.pyc
+*.bak-*
+.DS_Store
