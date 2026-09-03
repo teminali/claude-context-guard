@@ -38,7 +38,7 @@ Code) so the hooks load.
 | `config.json` | `~/.claude/handover/` | thresholds, share folder, toggles |
 | `state/` | `~/.claude/handover/` | per-session band state (which warnings already fired) |
 | guard hooks | `~/.claude/settings.json` | PostToolUse + UserPromptSubmit + SessionStart |
-| status line | `~/.claude/settings.json` | live `ctx 171k [####....] 86%` readout |
+| status line | `~/.claude/settings.json` | live `ctx 171k/220k [######..]` readout |
 | `handover` skill | `~/.claude/skills/handover/` | `/handover` — writes the doc |
 | 2 subagents | `~/.claude/agents/` | verify and staleness-check a pickup off-context |
 
@@ -59,6 +59,9 @@ The window is only *known* once a session passes 200k (transcripts record
 `claude-opus-5` for both the 200k and 1M variants), so percentage trips apply only when
 it is known. Pin it with `assume_window` if you always use one model — the bands
 themselves are absolute, so pinning changes the readout, not when they fire.
+
+Every display is drawn against CRITICAL rather than the window, because "12% of a 1M
+window" and "past AMBER, wrap up" are both true at 123k and only one of them is useful.
 
 ## Lanes: two sessions, one repo
 
@@ -118,9 +121,12 @@ handovers with 33 credited pickups:
 746.9M tokens not re-sent
 ```
 
-That number assumes each avoided session would have stayed flat at its handover size.
-In practice sessions keep growing, so it is a floor, not a ceiling. On a subscription
-the currency is your usage allowance rather than dollars.
+It is an estimate, and worth understanding before you quote it. Each credited row is
+`(context at handover - the fresh session's baseline) x the fresh session's turns`. That
+holds the abandoned session flat at its handover size, which understates it, and ignores
+that the fresh session also grows, which overstates it. The two errors largely cancel, so
+read it as an approximation rather than a floor. On a subscription the currency is your
+usage allowance rather than dollars.
 
 ## Another computer
 

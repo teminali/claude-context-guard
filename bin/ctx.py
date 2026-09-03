@@ -155,6 +155,19 @@ def read_context(path: Path) -> dict | None:
     return None
 
 
+def guard_ceiling(cfg: dict, window: int, known: bool) -> int:
+    """The number the bands actually fire against.
+
+    Progress toward the *window* is the wrong thing to show: on a 1M window a
+    123k context reads as 12% while the guard is saying wrap up. Progress toward
+    CRITICAL is the honest reading, and it is what every display here uses.
+    """
+    t = cfg["thresholds"]
+    if known:
+        return max(1, min(int(t["critical"]), int(window * cfg["pct_of_window"]["critical"])))
+    return max(1, int(t["critical"]))
+
+
 def window_for(model: str, observed: int, cfg: dict | None = None) -> int:
     return window_detail(model, observed, cfg)[0]
 
@@ -498,8 +511,8 @@ def cmd_guard(payload: dict) -> int:
             tok=f"{tokens:,}", cost=ratio, since=since,
             drift=fire_point_drift(cfg, payload.get("cwd") or os.getcwd()),
         )
-    pct = 100.0 * tokens / window
-    ui = f"context {fmt_tok(tokens)}/{fmt_tok(window)} ({pct:.0f}%) - {band.upper()}"
+    ceiling = guard_ceiling(cfg, window, known)
+    ui = f"context {fmt_tok(tokens)} of {fmt_tok(ceiling)} - {band.upper()}"
     if done_doc:
         ui += " - handover written, start a fresh session"
     elif band == "amber":
@@ -755,8 +768,9 @@ def cmd_statusline(payload: dict) -> int:
         window, known = window_detail(info["model"], tokens, cfg)
         band = band_for(tokens, window, cfg, known)
         col = BAND_COLOR[band]
-        frac = tokens / window
-        seg = f"{col}ctx {fmt_tok(tokens)} [{bar(frac)}] {100*frac:.0f}%{C_RESET}"
+        ceiling = guard_ceiling(cfg, window, known)
+        frac = tokens / ceiling
+        seg = f"{col}ctx {fmt_tok(tokens)}/{fmt_tok(ceiling)} [{bar(frac)}]{C_RESET}"
         if band == "amber":
             seg += f" {C_YELLOW}wrap up{C_RESET}"
         elif band == "red":
