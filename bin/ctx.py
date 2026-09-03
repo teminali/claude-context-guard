@@ -20,6 +20,7 @@ Subcommands:
   savings       what a handover here would save; --all for what past ones did
   report        token-waste report across local transcripts
   install       merge hooks + statusLine into a settings.json
+  update        check GitHub for a newer version and install it
   doctor        verify the install
 """
 from __future__ import annotations
@@ -30,15 +31,23 @@ import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
+# One line, shown to every session the update reaches. Say what changed, not what it is.
+UPDATE_NOTE = "checks GitHub once a day and updates itself, then tells you what changed"
 HOME = Path.home()
 ROOT = Path(os.environ.get("CLAUDE_HANDOVER_ROOT", str(HOME / ".claude" / "handover")))
+# ~/.claude, or the sandbox parent when CLAUDE_HANDOVER_ROOT is overridden - the skill
+# and the subagents live beside the handover root, and an update has to reach them too.
+CLAUDE_DIR = ROOT.parent
 STATE_DIR = ROOT / "state"
 CONFIG_PATH = ROOT / "config.json"
 PROJECTS = HOME / ".claude" / "projects"
@@ -68,6 +77,18 @@ DEFAULT_CONFIG = {
     # How stale an unclaimed handover may be and still be offered at SessionStart.
     "offer_max_age_hours": 48,
     "assume_window": 0,   # 0 = auto-detect; pin to 1000000 or 200000 to be explicit
+    # The tool is copied into ~/.claude, so a published fix reaches this machine
+    # only if something goes and gets it. This is that something.
+    "update": {
+        "enabled": True,
+        "auto_apply": True,          # false = tell me, let me run it
+        "check_every_hours": 24,
+        "notify": True,              # one line per session when something happened
+        "repo": "teminali/claude-context-guard",
+        "branch": "main",
+        "source": "",                # override the base URL: a fork, a mirror, or file:// in a test
+        "timeout_seconds": 10,
+    },
     "projection_turns": 20,   # turns the session would plausibly have continued
     "pricing": {
         # USD per 1M tokens, Anthropic list price. Verify at anthropic.com/pricing.
@@ -363,6 +384,504 @@ def emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
+# ----------------------------------------------------------------- locking ---
+@contextlib.contextmanager
+def exclusive_lock(lock: Path, stale: float, tries: int = 40):
+    """`O_EXCL` create around a read-modify-write, yielding whether we won it.
+
+    Two sessions that start in the same second both read the same state, both
+    believe they won, and both act - which is the exact failure a holder record
+    exists to prevent. `O_EXCL` decides it.
+
+    A lock older than `stale` seconds is assumed to belong to a dead process and
+    is broken. An unwritable directory yields `False` rather than raising: a
+    caller that treats losing as "someone else has it" is correct either way,
+    and a raised exception would cost the whole operation.
+    """
+    fd = None
+    for _ in range(tries):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > stale:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+        except OSError:
+            break
+    try:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.write(fd, f"{MACHINE} {os.getpid()} {now_iso()}\n".encode())
+            os.close(fd)
+        yield fd is not None
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                lock.unlink()
+
+
+# ------------------------------------------------------------------ update ---
+# ctx.py is *copied* into ~/.claude, never symlinked from a checkout, so a fix
+# published to GitHub reached a machine only when someone remembered to
+# `git pull && ./install.sh`. Nobody remembers. So: one check a day, applied by a
+# detached process - no hook ever waits on the network - and the next prompt in
+# any session tells the user what landed.
+UPDATE_LOCK_STALE_SECONDS = 300
+UPDATE_MIN_CTX_BYTES = 20000
+DEFAULT_MANIFEST = [
+    {"src": "bin/ctx.py", "dest": "root:bin/ctx.py", "exec": True},
+    {"src": "skills/handover/SKILL.md", "dest": "claude:skills/handover/SKILL.md"},
+    {"src": "agents/verify-pickup.md", "dest": "claude:agents/verify-pickup.md"},
+    {"src": "agents/handover-staleness.md", "dest": "claude:agents/handover-staleness.md"},
+]
+VERSION_RE = re.compile(r'^VERSION\s*=\s*"([0-9][0-9A-Za-z.\-]*)"', re.M)
+NOTE_RE = re.compile(r'^UPDATE_NOTE\s*=\s*"(.*)"[ \t]*$', re.M)
+
+
+def update_cfg(cfg: dict) -> dict:
+    return cfg.get("update") or {}
+
+
+def update_state_path() -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return STATE_DIR / "update.json"
+
+
+def load_update_state() -> dict:
+    try:
+        return json.loads(update_state_path().read_text())
+    except Exception:
+        return {}
+
+
+def save_update_state(st: dict) -> None:
+    try:
+        update_state_path().write_text(json.dumps(st, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def parse_version(s: str) -> tuple:
+    """1.10.0 > 1.9.0. String compare gets that wrong, so compare numerically."""
+    parts = []
+    for chunk in (s or "0").split(".")[:3]:
+        m = re.match(r"\d+", chunk.strip())
+        parts.append(int(m.group(0)) if m else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def update_source(cfg: dict) -> str:
+    """Where published files come from. `source` overrides for a fork, a
+    mirror, or a `file://` directory in a test."""
+    u = (update_cfg(cfg).get("source") or "").strip()
+    if not u:
+        repo = update_cfg(cfg).get("repo") or "teminali/claude-context-guard"
+        branch = update_cfg(cfg).get("branch") or "main"
+        u = f"https://raw.githubusercontent.com/{repo}/{branch}/"
+    return u if u.endswith("/") else u + "/"
+
+
+# A python.org build on macOS trusts nothing until somebody double-clicks
+# "Install Certificates.command", which nobody does - so `urlopen` fails with
+# CERTIFICATE_VERIFY_FAILED on a perfectly healthy machine. Rather than turn
+# verification off (an updater that will run anything it is handed is worse than
+# no updater), try the trust stores that are actually on disk, then curl, which
+# has the system one.
+CA_CANDIDATES = (
+    "/etc/ssl/cert.pem",                    # macOS
+    "/opt/homebrew/etc/openssl@3/cert.pem",
+    "/usr/local/etc/openssl@3/cert.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian
+)
+
+
+def ssl_contexts():
+    yield None                               # whatever this python was built to trust
+    with contextlib.suppress(Exception):
+        import certifi                       # noqa: PLC0415 - optional, absent on most machines
+        yield ssl.create_default_context(cafile=certifi.where())
+    for ca in CA_CANDIDATES:
+        if os.path.exists(ca):
+            with contextlib.suppress(Exception):
+                yield ssl.create_default_context(cafile=ca)
+
+
+def fetch_text(url: str, timeout: float) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"ctx.py/{VERSION}",
+        # raw.githubusercontent caches for 5 minutes; a check a day does not
+        # want yesterday's copy of it.
+        "Cache-Control": "no-cache",
+    })
+    last: Exception | None = None
+    for ctx in ssl_contexts():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.URLError as e:
+            if not isinstance(getattr(e, "reason", None), ssl.SSLError):
+                raise
+            last = e
+        except ssl.SSLError as e:
+            last = e
+    try:
+        r = subprocess.run(["curl", "-fsSL", "--max-time", str(int(timeout)), url],
+                           capture_output=True, timeout=timeout + 5)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.decode("utf-8", "replace")
+    except Exception:
+        pass
+    raise last or urllib.error.URLError(f"could not fetch {url}")
+
+
+def resolve_dest(dest: str) -> Path | None:
+    """An update may only write inside the install. Anything else is refused -
+    a manifest is remote input, and remote input does not get to name
+    `~/.zshrc`."""
+    for prefix, base in (("root:", ROOT), ("claude:", CLAUDE_DIR)):
+        if dest.startswith(prefix):
+            p = (base / dest[len(prefix):].lstrip("/")).resolve()
+            try:
+                p.relative_to(base.resolve())
+            except ValueError:
+                return None
+            return p
+    return None
+
+
+def check_update(cfg: dict) -> dict:
+    """Read the published ctx.py and compare versions. Writes nothing."""
+    timeout = float(update_cfg(cfg).get("timeout_seconds", 10))
+    src = update_source(cfg)
+    text = fetch_text(src + "bin/ctx.py", timeout)
+    m = VERSION_RE.search(text)
+    if not m:
+        raise ValueError(f"{src}bin/ctx.py has no VERSION line - wrong source?")
+    remote = m.group(1)
+    note = NOTE_RE.search(text)
+    return {"local": VERSION, "remote": remote, "note": note.group(1) if note else "",
+            "newer": parse_version(remote) > parse_version(VERSION),
+            "source": src, "text": text}
+
+
+def remote_manifest(cfg: dict, timeout: float) -> list[dict]:
+    """The published file list, so a later release can add a file this version
+    has never heard of. Falls back to what this version knows."""
+    try:
+        items = json.loads(fetch_text(update_source(cfg) + "update-manifest.json", timeout))
+        good = [i for i in items if isinstance(i, dict) and i.get("src") and i.get("dest")]
+        return good or DEFAULT_MANIFEST
+    except Exception:
+        return DEFAULT_MANIFEST
+
+
+def backup_slug(dest: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", dest)
+
+
+def prune_backups(keep: int = 3) -> None:
+    bdir = ROOT / "backup"
+    try:
+        dirs = sorted((p for p in bdir.iterdir() if p.is_dir()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in dirs[keep:]:
+        for f in old.iterdir():
+            with contextlib.suppress(OSError):
+                f.unlink()
+        with contextlib.suppress(OSError):
+            old.rmdir()
+
+
+def apply_update(cfg: dict, force: bool = False) -> dict:
+    ucfg = update_cfg(cfg)
+    timeout = float(ucfg.get("timeout_seconds", 10))
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with exclusive_lock(STATE_DIR / "update.lock", UPDATE_LOCK_STALE_SECONDS, tries=2) as won:
+        if not won:
+            return {"status": "busy"}
+        info = check_update(cfg)
+        if not info["newer"] and not force:
+            return {"status": "current", "local": VERSION, "to": info["remote"]}
+        if not force and info["remote"] == (load_update_state().get("skip_version") or ""):
+            return {"status": "skipped", "to": info["remote"]}
+
+        # Fetch and validate everything before touching a single installed file:
+        # a half-applied update is a broken install, and the thing being
+        # replaced is the code that would have to explain that.
+        staged = []
+        for item in remote_manifest(cfg, timeout):
+            dest = resolve_dest(item["dest"])
+            if dest is None:
+                return {"status": "error", "error": f"refused destination: {item['dest']}"}
+            text = info["text"] if item["src"] == "bin/ctx.py" else \
+                fetch_text(update_source(cfg) + item["src"], timeout)
+            if item["src"].endswith(".py"):
+                if len(text) < UPDATE_MIN_CTX_BYTES or "def main(" not in text:
+                    return {"status": "error", "error": f"{item['src']} looks truncated"}
+                compile(text, item["src"], "exec")   # never install a file that will not parse
+            elif len(text.strip()) < 200:
+                return {"status": "error", "error": f"{item['src']} looks truncated"}
+            staged.append((item, dest, text))
+
+        bdir = ROOT / "backup" / VERSION
+        bdir.mkdir(parents=True, exist_ok=True)
+        rolled = []
+        for item, dest, text in staged:
+            if dest.exists():
+                slug = backup_slug(item["dest"])
+                (bdir / slug).write_bytes(dest.read_bytes())
+                rolled.append({"dest": item["dest"], "file": slug})
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".ctxnew")
+            tmp.write_text(text)
+            if item.get("exec"):
+                os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)          # atomic: a concurrent hook reads one or the other
+        (bdir / "manifest.json").write_text(json.dumps(rolled, indent=2) + "\n")
+        prune_backups()
+
+        # A release may add or rename a hook. Re-wire from the *new* file, and
+        # only when it actually differs - otherwise every update leaves another
+        # settings.json backup behind.
+        rewired = False
+        try:
+            r = subprocess.run([sys.executable, str(ROOT / "bin" / "ctx.py"),
+                                "install", "--if-needed", "--quiet"],
+                               capture_output=True, text=True, timeout=30)
+            rewired = "installed into" in (r.stdout or "")
+        except Exception:
+            pass
+        st = load_update_state()
+        st.pop("skip_version", None)
+        save_update_state(st)
+        return {"status": "updated", "from": VERSION, "to": info["remote"],
+                "note": info["note"], "source": info["source"], "hooks_rewired": rewired}
+
+
+def record_notice(kind: str, **fields) -> None:
+    """Park what happened where every session will see it once.
+
+    Re-arms the per-session list only when the notice is genuinely new, so a
+    check that fails the same way every day nags exactly once."""
+    st = load_update_state()
+    prev = st.get("notice") or {}
+    notice = dict(fields, kind=kind)
+    if any(prev.get(k) != v for k, v in notice.items()):
+        st["notified"] = []
+    notice["at"] = now_iso()
+    st["notice"] = notice
+    save_update_state(st)
+
+
+def update_rollback(quiet: bool = False) -> int:
+    bdir = ROOT / "backup"
+    dirs = []
+    if bdir.is_dir():
+        dirs = sorted((p for p in bdir.iterdir() if p.is_dir() and (p / "manifest.json").exists()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    if not dirs:
+        print("no backup to roll back to", file=sys.stderr)
+        return 1
+    b = dirs[0]
+    restored = 0
+    for entry in json.loads((b / "manifest.json").read_text()):
+        dest = resolve_dest(entry["dest"])
+        src = b / entry["file"]
+        if not dest or not src.exists():
+            continue
+        tmp = dest.with_name(dest.name + ".ctxnew")
+        tmp.write_bytes(src.read_bytes())
+        os.chmod(tmp, os.stat(dest).st_mode & 0o777 if dest.exists() else 0o644)
+        os.replace(tmp, dest)
+        restored += 1
+    st = load_update_state()
+    # Without this the next daily check would cheerfully reinstall the version
+    # you just backed out of.
+    st["skip_version"] = st.get("notice", {}).get("to") or ""
+    st["notice"] = None
+    save_update_state(st)
+    if not quiet:
+        print(f"rolled back to {b.name} ({restored} file(s))")
+        if st["skip_version"]:
+            print(f"pinned away from {st['skip_version']} - `update --force` installs it again")
+    return 0
+
+
+def maybe_spawn_update_check(cfg: dict) -> None:
+    """Due? Then fork the check off and return immediately.
+
+    A hook has a 10s budget and shares it with the user's turn. Nothing here
+    touches the network - it reads one small JSON file and, at most once a day,
+    starts a detached process."""
+    ucfg = update_cfg(cfg)
+    if not ucfg.get("enabled", True):
+        return
+    every = float(ucfg.get("check_every_hours", 24) or 0)
+    if every <= 0:
+        return
+    st = load_update_state()
+    if time.time() - float(st.get("last_check") or 0) < every * 3600:
+        return
+    st["last_check"] = time.time()          # claim the slot before the network, not after
+    st["last_check_iso"] = now_iso()
+    save_update_state(st)
+    with contextlib.suppress(Exception):
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "update", "--background"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, cwd=str(ROOT))
+
+
+UPDATE_TEXT = {
+    "updated": (
+        "HANDOVER TOOLKIT UPDATED - it updated itself from {frm} to {to} ({at}), from {source}.\n"
+        "{note}"
+        "It is already live: every hook and command re-reads the file, so there is nothing to "
+        "restart and no action for the user. Tell them in one line that the update landed and "
+        "what it changes, then get on with what they actually asked. Do not go and read the "
+        "tool's source to verify this."
+    ),
+    "available": (
+        "HANDOVER TOOLKIT UPDATE AVAILABLE - {to} is published, this machine is on {frm}. "
+        "Automatic apply is off in config.json, so nothing has changed.\n"
+        "{note}"
+        "Tell the user in one line, and that `python3 ~/.claude/handover/bin/ctx.py update "
+        "--force` installs it. Do not install it for them unless they ask."
+    ),
+    "failed": (
+        "HANDOVER TOOLKIT - the daily update check failed: {error}\n"
+        "Nothing changed and the tool works exactly as before; the next check is in a day. "
+        "Mention it in one line - once - and carry on. Do not debug it unless the user asks."
+    ),
+}
+
+
+def update_notice(sid: str, cfg: dict) -> tuple[str, str] | None:
+    """The pending notice, once per session. Returns (status line, context)."""
+    if not update_cfg(cfg).get("notify", True):
+        return None
+    st = load_update_state()
+    n = st.get("notice")
+    if not n or n.get("kind") not in UPDATE_TEXT:
+        return None
+    key = sid or "unknown"
+    seen = st.get("notified") or []
+    if key in seen:
+        return None
+    st["notified"] = (seen + [key])[-50:]
+    save_update_state(st)
+
+    note = n.get("note") or ""
+    body = UPDATE_TEXT[n["kind"]].format(
+        frm=n.get("frm", "?"), to=n.get("to", "?"), at=n.get("at", ""),
+        source=n.get("source", "github"), error=n.get("error", "unknown"),
+        note=(f"What changed: {note}\n" if note else ""))
+    head = {
+        "updated": f"handover toolkit updated {n.get('frm','?')} -> {n.get('to','?')}",
+        "available": f"handover toolkit {n.get('to','?')} available (you have {n.get('frm','?')})",
+        "failed": "handover toolkit: update check failed",
+    }[n["kind"]]
+    return head, body
+
+
+def emit_update_only(upd: "tuple[str, str] | None", event: str) -> int:
+    if upd:
+        emit({"systemMessage": upd[0],
+              "hookSpecificOutput": {"hookEventName": event, "additionalContext": upd[1]}})
+    return 0
+
+
+def merge_update(out: dict, upd: "tuple[str, str] | None") -> dict:
+    """One hook call, one JSON object: fold the notice into whatever the guard
+    was already going to say."""
+    if not upd:
+        return out
+    out["systemMessage"] = f"{out.get('systemMessage', '')} | {upd[0]}".strip(" |")
+    hso = out.setdefault("hookSpecificOutput", {})
+    hso["additionalContext"] = (hso.get("additionalContext", "") + "\n\n" + upd[1]).strip()
+    return out
+
+
+def cmd_update(args: list[str]) -> int:
+    cfg = load_config()
+    ucfg = update_cfg(cfg)
+    background = "--background" in args
+    quiet = background or "--quiet" in args
+    if "--rollback" in args:
+        return update_rollback(quiet)
+    if background and not ucfg.get("enabled", True):
+        return 0
+    force = "--force" in args
+    check_only = "--check" in args
+
+    st = load_update_state()
+    st["last_check"] = time.time()
+    st["last_check_iso"] = now_iso()
+    save_update_state(st)
+
+    try:
+        if check_only:
+            info = check_update(cfg)
+            print(f"installed {info['local']}   published {info['remote']}   "
+                  + ("UPDATE AVAILABLE" if info["newer"] else "up to date"))
+            if info["newer"] and info["note"]:
+                print(f"note: {info['note']}")
+            return 0
+        if not ucfg.get("auto_apply", True) and not force:
+            info = check_update(cfg)
+            if info["newer"]:
+                record_notice("available", frm=info["local"], to=info["remote"],
+                              note=info["note"], source=info["source"])
+                if not quiet:
+                    print(f"{info['remote']} available (auto_apply is off) - "
+                          "install it with: update --force")
+            elif not quiet:
+                print(f"up to date ({VERSION})")
+            return 0
+        res = apply_update(cfg, force=force)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        if background:
+            record_notice("failed", error=err)
+            return 0
+        print(f"update failed: {err}", file=sys.stderr)
+        return 1
+
+    status = res.get("status")
+    if status == "updated":
+        record_notice("updated", frm=res["from"], to=res["to"],
+                      note=res.get("note", ""), source=res.get("source", ""))
+        if not quiet:
+            print(f"updated {res['from']} -> {res['to']}")
+            if res.get("note"):
+                print(f"note: {res['note']}")
+            if res.get("hooks_rewired"):
+                print("hooks re-wired in settings.json")
+        return 0
+    if status in ("current", "busy", "skipped"):
+        if not quiet:
+            print({"current": f"up to date ({VERSION})",
+                   "busy": "another update is already running",
+                   "skipped": f"{res.get('to')} is the version you rolled back from"
+                              " - `update --force` installs it again"}[status])
+        return 0
+    if background:
+        record_notice("failed", error=res.get("error", "unknown"))
+        return 0
+    print(f"update failed: {res.get('error', 'unknown')}", file=sys.stderr)
+    return 1
+
+
 # ------------------------------------------------------------------ guard ---
 GUARD_TEXT = {
     "amber": (
@@ -435,15 +954,30 @@ def fire_point_drift(cfg: dict, cwd: str, limit: int = 8) -> str:
 
 def cmd_guard(payload: dict) -> int:
     cfg = load_config()
+    event = payload.get("hook_event_name") or "PostToolUse"
+    upd = None
+    # Once per prompt, never per tool call: this is where a session that has been
+    # open for days finds out a new version was published, and says so.
+    if event == "UserPromptSubmit":
+        maybe_spawn_update_check(cfg)
+        upd = update_notice(payload.get("session_id") or "", cfg)
+    out = guard_output(payload, cfg)
+    if out is None:
+        return emit_update_only(upd, event)
+    emit(merge_update(out, upd))
+    return 0
+
+
+def guard_output(payload: dict, cfg: dict) -> "dict | None":
     if not cfg.get("enabled", True):
-        return 0
+        return None
 
     event = payload.get("hook_event_name") or "PostToolUse"
     session_id = payload.get("session_id") or ""
     tpath = payload.get("transcript_path")
     path = Path(tpath) if tpath else find_transcript(payload.get("cwd"), session_id)
     if not path or not path.exists():
-        return 0
+        return None
 
     st = load_state(session_id)
     size = path.stat().st_size
@@ -452,13 +986,13 @@ def cmd_guard(payload: dict) -> int:
     if event == "PostToolUse":
         last_size = st.get("last_size", 0)
         if size - last_size < cfg.get("min_growth_bytes", 40000):
-            return 0
+            return None
 
     info = read_context(path)
     st["last_size"] = size
     if not info:
         save_state(session_id, st)
-        return 0
+        return None
 
     tokens = info["tokens"]
     window, known = window_detail(info["model"], tokens, cfg)
@@ -482,7 +1016,7 @@ def cmd_guard(payload: dict) -> int:
     if band == "green":
         st["fired"] = fired
         save_state(session_id, st)
-        return 0
+        return None
 
     # One nudge per band was too easy to scroll past: sessions took the AMBER
     # warning and still drifted 60-100k beyond it before handing over. Re-warn on
@@ -492,7 +1026,7 @@ def cmd_guard(payload: dict) -> int:
     if not new_band and tokens - last_notice < renotify:
         st["fired"] = fired
         save_state(session_id, st)
-        return 0
+        return None
 
     if new_band:
         fired.append(band)
@@ -538,8 +1072,7 @@ def cmd_guard(payload: dict) -> int:
     if blocking:
         out["decision"] = "block"
         out["reason"] = text
-    emit(out)
-    return 0
+    return out
 
 
 # ----------------------------------------------------------- session start ---
@@ -547,10 +1080,12 @@ def cmd_sessionstart(payload: dict) -> int:
     cfg = load_config()
     cwd = payload.get("cwd") or os.getcwd()
     sid = payload.get("session_id") or ""
+    maybe_spawn_update_check(cfg)
+    upd = update_notice(sid, cfg)
     max_age = float(cfg.get("offer_max_age_hours", 48))
     docs = pending_by_lane(cfg, cwd, max_age_hours=max_age)
     if not docs:
-        return 0
+        return emit_update_only(upd, "SessionStart")
 
     # A session that has already claimed a lane is only ever shown that lane.
     # Without this, a long-running session that resumes gets re-offered whatever
@@ -559,7 +1094,7 @@ def cmd_sessionstart(payload: dict) -> int:
     if bound:
         docs = [d for d in docs if d["lane"] == bound]
         if not docs:
-            return 0
+            return emit_update_only(upd, "SessionStart")
 
     if len(docs) == 1:
         d = docs[0]
@@ -579,7 +1114,7 @@ def cmd_sessionstart(payload: dict) -> int:
             if rc == 3:
                 # Another session claimed it between the scan and the claim.
                 # Offering it anyway is how both sessions end up on one lane.
-                return 0
+                return emit_update_only(upd, "SessionStart")
         if not auto:
             bind_session_lane(sid, d["lane"])
         claim = ("It is already marked consumed, so nothing is needed to claim it."
@@ -622,10 +1157,10 @@ def cmd_sessionstart(payload: dict) -> int:
             "doing. `pickup` is the only way in. Exit 3 means another session got "
             "there first - pick a different lane, do not force it."
         )
-    emit({
+    emit(merge_update({
         "systemMessage": f"handover pending: {len(docs)} lane(s)",
         "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": note},
-    })
+    }, upd))
     return 0
 
 
@@ -698,44 +1233,12 @@ def same_session(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-@contextlib.contextmanager
 def claim_lock(doc: Path):
-    """Exclusive create around the read-modify-write of the frontmatter.
+    """The frontmatter read-modify-write of a handover claim, held exclusively.
 
-    Two sessions that start in the same second both read `status: pending`,
-    both believe they won, and both work the same lane - which is the exact
-    failure writing a holder into the doc exists to prevent. `O_EXCL` decides
-    it. Named `<doc>.claim` so the `HANDOVER-*.md` glob never sees it.
-
-    An unwritable directory yields unlocked rather than failing: a missing lock
-    costs a rare race, a raised exception costs the pickup.
+    Named `<doc>.claim` so the `HANDOVER-*.md` glob never sees it.
     """
-    lock = doc.parent / (doc.name + ".claim")
-    fd = None
-    for _ in range(40):
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > CLAIM_STALE_SECONDS:
-                    lock.unlink()
-                    continue
-            except OSError:
-                pass
-            time.sleep(0.05)
-        except OSError:
-            break
-    try:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.write(fd, f"{MACHINE} {os.getpid()} {now_iso()}\n".encode())
-            os.close(fd)
-        yield
-    finally:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                lock.unlink()
+    return exclusive_lock(doc.parent / (doc.name + ".claim"), CLAIM_STALE_SECONDS)
 
 
 def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48,
@@ -2014,9 +2517,27 @@ HOOK_SPECS = {
 }
 
 
+def install_is_current(settings: dict) -> bool:
+    """Is every hook already wired to exactly the command this version wants?
+
+    An update that adds or renames a hook has to re-wire settings.json; one that
+    does not must leave it alone, or every release drops another `.bak-` file in
+    the user's ~/.claude.
+    """
+    for event, (sub, _label) in HOOK_SPECS.items():
+        want = f"python3 {CMD} {sub}"
+        if not any((h.get("command") or "") == want
+                   for e in (settings.get("hooks", {}).get(event) or [])
+                   for h in (e.get("hooks") or [])):
+            return False
+    return "ctx.py" in ((settings.get("statusLine") or {}).get("command") or "")
+
+
 def cmd_install(args: list[str]) -> int:
     project = None
     force_status = "--force-statusline" in args
+    if_needed = "--if-needed" in args
+    quiet = "--quiet" in args
     for i, a in enumerate(args):
         if a == "--project" and i + 1 < len(args):
             project = Path(args[i + 1])
@@ -2030,9 +2551,14 @@ def cmd_install(args: list[str]) -> int:
         except Exception:
             print(f"ERROR: {target} is not valid JSON - fix it first", file=sys.stderr)
             return 1
+        if if_needed and install_is_current(settings):
+            if not quiet:
+                print(f"settings already current: {target}")
+            return 0
         backup = target.with_suffix(f".json.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
         backup.write_text(raw)
-        print(f"backup: {backup}")
+        if not quiet:
+            print(f"backup: {backup}")
 
     hooks = settings.setdefault("hooks", {})
     for event, (sub, label) in HOOK_SPECS.items():
@@ -2051,16 +2577,18 @@ def cmd_install(args: list[str]) -> int:
         settings["statusLine"] = {"type": "command",
                                   "command": f"python3 {CMD} statusline",
                                   "padding": 0}
-    else:
+    elif not quiet:
         print("note: statusLine already set, left alone (use --force-statusline to replace)")
 
     target.write_text(json.dumps(settings, indent=2) + "\n")
-    print(f"installed into {target}")
-    print("hooks: " + ", ".join(HOOK_SPECS))
-    print("open /hooks once (or restart Claude Code) to load them")
+    print(f"installed into {target}")   # the updater reads this line to report a re-wire
+    if not quiet:
+        print("hooks: " + ", ".join(HOOK_SPECS))
+        print("open /hooks once (or restart Claude Code) to load them")
     if not CONFIG_PATH.exists():
         save_config(DEFAULT_CONFIG)
-        print(f"wrote default config: {CONFIG_PATH}")
+        if not quiet:
+            print(f"wrote default config: {CONFIG_PATH}")
     return 0
 
 
@@ -2074,6 +2602,19 @@ def cmd_doctor(args: list[str]) -> int:
           f" | critical {cfg['thresholds']['critical']:,}")
     sd = share_dir(cfg)
     print(f"share dir  : {sd if sd else '(not set - single machine only)'}")
+    u = update_cfg(cfg)
+    ust = load_update_state()
+    if u.get("enabled", True):
+        line = (f"auto-update: every {u.get('check_every_hours', 24)}h from {update_source(cfg)}"
+                + ("" if u.get("auto_apply", True) else "  (apply=manual)"))
+    else:
+        line = "auto-update: off"
+    print(line)
+    print(f"last check : {ust.get('last_check_iso') or 'never'}")
+    n = ust.get("notice") or {}
+    if n:
+        print(f"last event : {n.get('kind')} {n.get('frm', '')}"
+              f"{' -> ' + n.get('to', '') if n.get('to') else ''}  {n.get('at', '')}")
     st = HOME / ".claude" / "settings.json"
     try:
         s = json.loads(st.read_text())
@@ -2148,6 +2689,8 @@ def main(argv: list[str]) -> int:
             return cmd_savings(args)
         if cmd == "report":
             return cmd_report(args)
+        if cmd == "update":
+            return cmd_update(args)
         if cmd == "install":
             return cmd_install(args)
         if cmd == "doctor":

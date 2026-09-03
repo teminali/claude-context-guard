@@ -30,6 +30,8 @@ Idempotent — re-run it after any `git pull`. It never overwrites your `config.
 your handover docs, or your per-session state. Open `/hooks` once (or restart Claude
 Code) so the hooks load.
 
+You only do that once: from then on it [keeps itself up to date](#staying-up-to-date).
+
 ## What gets installed
 
 | Piece | Where | Does |
@@ -37,6 +39,7 @@ Code) so the hooks load.
 | `bin/ctx.py` | `~/.claude/handover/` | the whole engine, stdlib-only |
 | `config.json` | `~/.claude/handover/` | thresholds, share folder, toggles |
 | `state/` | `~/.claude/handover/` | per-session band state (which warnings already fired) |
+| `backup/` | `~/.claude/handover/` | the last 3 versions it replaced, for `update --rollback` |
 | guard hooks | `~/.claude/settings.json` | PostToolUse + UserPromptSubmit + SessionStart |
 | status line | `~/.claude/settings.json` | live `ctx 171k/220k [######..]` readout |
 | `handover` skill | `~/.claude/skills/handover/` | `/handover` — writes the doc |
@@ -132,6 +135,61 @@ python3 $ctx show                # print the newest one
 python3 $ctx consume <file>      # claim one (exit 3 = another session holds it)
 python3 $ctx release --lane X    # hand a claim back after a session dies
 python3 $ctx doctor              # verify the install
+python3 $ctx update --check      # is a newer version published?
+python3 $ctx update              # install it now, without waiting for the daily check
+python3 $ctx update --rollback   # put the previous version back, and stay there
+```
+
+## Staying up to date
+
+The tool is *copied* into `~/.claude`, not symlinked from a checkout, so a fix published
+here used to reach a machine only when somebody remembered to `git pull && ./install.sh`.
+Nobody remembers. So it fetches its own updates:
+
+- **Once every 24 hours**, on the first prompt of any session after the interval is up.
+- **In a detached process.** A hook has a ~10s budget and shares it with your turn;
+  nothing on that path ever touches the network. The check is one small file read, and
+  at most once a day, one `Popen`.
+- **Validated before it lands.** Every file is fetched and checked first — the new
+  `ctx.py` must parse (`compile()`) and look like a whole file — and only then are the
+  installed copies replaced, atomically, with `os.replace`. A half-applied update would
+  break the very code that has to explain itself.
+- **Backed up.** The version it replaced goes to `backup/<version>/`; `update --rollback`
+  restores it and pins you there, so the next day's check does not cheerfully reinstall
+  what you just backed out of. `update --force` un-pins it.
+- **Announced.** The next prompt in *every* open session gets one line: what version
+  landed and what changed. Once per session, never twice.
+- **Hook-aware.** If a release adds or renames a hook, it re-wires `settings.json` —
+  and only then, so releases do not litter your `~/.claude` with `.bak-` files.
+
+A release says what it changed in one line (`UPDATE_NOTE` at the top of `bin/ctx.py`),
+and that line is what your sessions are shown.
+
+### Publishing one (maintainer)
+
+```bash
+./release.sh 1.6.0 "what changed, in one line"
+```
+
+Refuses a version that is not numerically newer than the one on `main` (clients compare
+`1.10.0 > 1.9.0` numerically, so a string bump would just be ignored), refuses a dirty
+tree, then bumps `VERSION` + `UPDATE_NOTE`, writes the [CHANGELOG](CHANGELOG.md) entry,
+commits, tags `v1.6.0` and pushes. Every install picks it up on its next daily check —
+that one-line note is the whole message those users get, so write it for them.
+
+Tune or disable it in `config.json`:
+
+```jsonc
+"update": {
+  "enabled": true,          // false: never check, never phone home
+  "auto_apply": true,       // false: tell me a version is out, let me run it
+  "check_every_hours": 24,
+  "notify": true,           // false: update silently
+  "repo": "teminali/claude-context-guard",
+  "branch": "main",
+  "source": "",             // a fork, a mirror, or file:///... in a test
+  "timeout_seconds": 10
+}
 ```
 
 ## Does it work?
@@ -179,7 +237,12 @@ That writes `<repo>/.claude/settings.json`, so anyone working in the repo gets t
 
 Everything stays on your machine. `state/` (session ids, token counts, local doc paths)
 and your live `config.json` are gitignored; handover docs are written into your own
-projects and, if you configure one, your own synced folder. Nothing is sent anywhere.
+projects and, if you configure one, your own synced folder.
+
+Nothing of yours is sent anywhere. The one outbound request is the update check: an
+unauthenticated `GET` to `raw.githubusercontent.com`, at most once a day, carrying
+nothing but a `ctx.py/<version>` user agent. `"update": {"enabled": false}` stops even
+that.
 
 ## Turning it off
 
@@ -188,6 +251,10 @@ python3 -c "import json,pathlib;p=pathlib.Path.home()/'.claude/handover/config.j
 ```
 
 Or restore a settings backup: `~/.claude/settings.json.bak-*`.
+
+To keep the guard but stop the updates, set `"update": {"enabled": false}` in
+`config.json` — or `"auto_apply": false` to be told about new versions without
+installing them.
 
 ## License
 

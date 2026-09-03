@@ -50,3 +50,4 @@ echo
 python3 "$ROOT/bin/ctx.py" doctor || true
 echo
 echo "Done. Open /hooks once (or restart Claude Code) so the hooks load."
+echo "It checks GitHub for updates once a day from here on - disable with update.enabled=false in ~/.claude/handover/config.json."

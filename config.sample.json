@@ -17,5 +17,15 @@
   "clipboard": true,
   "block_at_red": false,
   "renotify_tokens": 25000,
-  "assume_window": 0
+  "assume_window": 0,
+  "update": {
+    "enabled": true,
+    "auto_apply": true,
+    "check_every_hours": 24,
+    "notify": true,
+    "repo": "teminali/claude-context-guard",
+    "branch": "main",
+    "source": "",
+    "timeout_seconds": 10
+  }
 }

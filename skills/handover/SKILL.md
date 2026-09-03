@@ -229,4 +229,5 @@ Rules of thumb:
 | `ctx.py list --all` | ...including claimed ones, and who holds them |
 | `ctx.py show` | print the newest handover |
 | `ctx.py doctor` | verify hooks, statusline, config, share dir |
+| `ctx.py update --check` | is a newer version of the toolkit published? |
 | `ctx.py install` | wire the guard into settings.json (run once per machine) |

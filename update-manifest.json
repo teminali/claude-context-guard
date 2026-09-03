@@ -1,0 +1,6 @@
+[
+  { "src": "bin/ctx.py",                     "dest": "root:bin/ctx.py", "exec": true },
+  { "src": "skills/handover/SKILL.md",       "dest": "claude:skills/handover/SKILL.md" },
+  { "src": "agents/verify-pickup.md",        "dest": "claude:agents/verify-pickup.md" },
+  { "src": "agents/handover-staleness.md",   "dest": "claude:agents/handover-staleness.md" }
+]
