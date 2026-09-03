@@ -71,14 +71,35 @@ it executes another thread's plan with full confidence.
 
 So every handover is tagged with a **lane**: one thread of work. On a fresh session:
 
-- **One lane pending** — the doc is injected and auto-consumed. A bare `continue` picks
-  up exactly where the last session stopped. Nothing to paste.
+- **One lane pending** — the doc is injected and claimed in the same breath. A bare
+  `continue` picks up exactly where the last session stopped. Nothing to paste.
 - **Several lanes pending** — the list is injected and *nothing* is claimed. Claude asks
   which one. Guessing is the one unrecoverable failure, so it does not guess.
 - **A session already bound to a lane** is never offered a sibling lane's doc.
 
 Writing a handover retires only its own lane's previous doc, so concurrent sessions
 cannot silently kill each other's work.
+
+### The claim is exclusive
+
+A picked-up handover is owned. `status:` in the doc's own frontmatter is the lock —
+the one thing every session and every machine can see — and it carries the holder's
+machine and session id.
+
+- Claiming a doc someone else holds **fails with exit 3** and prints who has it. It was
+  previously a courtesy: the rewrite quietly did nothing on an already-claimed doc and
+  the caller carried on as though it had won, so two agents could work one lane while
+  each believed it owned it.
+- `pickup` that loses the race does **not** print the doc. Printing it *is* the pickup.
+- Claiming twice from the same session is a no-op, not a refusal — a resumed session
+  must be able to re-run its own pickup.
+- The read-modify-write is guarded by an `O_EXCL` sidecar lock, so two sessions starting
+  in the same second cannot both see `pending`. A lock older than 90s is treated as a
+  killed process and broken.
+- A session that claims a lane and then dies would otherwise take the work with it, since
+  claimed docs are filtered out of every offer. `ctx.py release --lane X` hands it back.
+  There is no timeout: nothing here can tell a crash from an agent that is still
+  thinking, so releasing is deliberate.
 
 ## Picking up cheaply
 
@@ -105,9 +126,11 @@ python3 $ctx pickup --lane X     # print a lane's doc and claim it, one call
 python3 $ctx report --days 7     # where tokens actually went, all local sessions
 python3 $ctx savings             # what handing over right now would save
 python3 $ctx savings --all       # what the handovers already written actually saved
-python3 $ctx list                # handovers for this project, with lanes, every machine
+python3 $ctx list                # open handovers for this project, with lanes
+python3 $ctx list --all          # ...including claimed ones, and who holds them
 python3 $ctx show                # print the newest one
-python3 $ctx consume <file>      # mark one as picked up
+python3 $ctx consume <file>      # claim one (exit 3 = another session holds it)
+python3 $ctx release --lane X    # hand a claim back after a session dies
 python3 $ctx doctor              # verify the install
 ```
 

@@ -151,7 +151,7 @@ SessionStart injects the pending doc into a fresh session automatically. There i
 start-here prompt to paste and no clipboard step — **a bare `continue` is enough.**
 
 **One lane pending** (the normal case): the doc's path, lane and title are already in your
-context and it is already marked consumed. Read it, confirm the next step in one line, and
+context and it is already claimed for you. Read it, confirm the next step in one line, and
 start. Do not re-explore the codebase; the doc lists the files that matter.
 
 **Several lanes pending** (two sessions were open on this project): nothing is claimed, on
@@ -161,9 +161,14 @@ purpose. Resolve it like this, in order:
    ```bash
    python3 ~/.claude/handover/bin/ctx.py pickup --lane <lane>
    ```
-   That prints the whole doc *and* marks it consumed — one round trip, not two.
+   That prints the whole doc *and* claims it — one round trip, not two.
 2. If it is ambiguous — a bare `continue` with several lanes open — **ask which lane**,
    listing the titles. Never pick for them.
+
+**Never open a pending doc with `Read`.** Reading it does not claim it, so it stays on
+offer and the next session is handed work you are already doing. `pickup` is the only way
+in. Its exit codes are the answer, not noise: **2** is ambiguous (ask), **3** is *another
+session already holds this* — pick a different lane rather than forcing it.
 
 Guessing is the one unrecoverable failure mode here. A session with no handover asks a
 question; a session with the *wrong* handover confidently executes another thread's plan.
@@ -172,7 +177,20 @@ question; a session with the *wrong* handover confidently executes another threa
 stale doc that was already consumed.
 
 Once claimed, the session is pinned to that lane: it will never be offered a sibling
-lane's doc on resume, and any handover it writes later stays on the same thread.
+lane's doc on resume, and any handover it writes later stays on the same thread. The claim
+is exclusive and written into the doc's `status:` line with the holding machine and
+session, so a second agent that tries the same lane is refused rather than quietly let
+through.
+
+If a session claimed a lane and then died, its doc is held by a session that no longer
+exists — invisible to every offer. Hand it back deliberately:
+
+```bash
+python3 ~/.claude/handover/bin/ctx.py release --lane <lane>
+```
+
+Do that only when you know that session is gone. There is no timeout, because nothing
+here can tell a crash from an agent that is still thinking.
 
 ### Delegate the expensive half of a pickup
 
@@ -201,12 +219,14 @@ Rules of thumb:
 | Command | Use |
 |---|---|
 | `ctx.py brief` | **status + facts in one call** — use this when writing a handover |
-| `ctx.py pickup --lane X` | print and claim a lane's doc in one call (exit 2 = ambiguous) |
+| `ctx.py pickup --lane X` | print and claim a lane's doc (exit 2 = ambiguous, 3 = held) |
+| `ctx.py release --lane X` | hand a claim back when the session holding it is gone |
 | `ctx.py status` | context tokens, band, thresholds for this session |
 | `ctx.py report --days 7` | where tokens actually went, across all local sessions |
 | `ctx.py savings` | what handing over right now would save from here |
 | `ctx.py savings --all` | what the handovers already written actually saved |
-| `ctx.py list` | handovers for this project, with lanes, from every machine |
+| `ctx.py list` | open handovers for this project, with lanes, from every machine |
+| `ctx.py list --all` | ...including claimed ones, and who holds them |
 | `ctx.py show` | print the newest handover |
 | `ctx.py doctor` | verify hooks, statusline, config, share dir |
 | `ctx.py install` | wire the guard into settings.json (run once per machine) |

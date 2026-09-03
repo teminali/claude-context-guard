@@ -14,7 +14,9 @@ Subcommands:
   write         finalise a handover doc (adds metadata, mirrors, clipboard)
   list          list recent handovers (all machines, if a share dir is set)
   show          print a handover doc
-  consume       mark a handover as picked up
+  pickup        print a lane's doc and claim it, in one call
+  consume       claim a handover for this session (exit 3: another holds it)
+  release       hand a claimed handover back to the pool
   savings       what a handover here would save; --all for what past ones did
   report        token-waste report across local transcripts
   install       merge hooks + statusLine into a settings.json
@@ -34,7 +36,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 HOME = Path.home()
 ROOT = Path(os.environ.get("CLAUDE_HANDOVER_ROOT", str(HOME / ".claude" / "handover")))
 STATE_DIR = ROOT / "state"
@@ -569,10 +571,15 @@ def cmd_sessionstart(payload: dict) -> int:
         if auto:
             try:
                 # cmd_consume reports on stdout, which in a hook is the JSON channel.
-                with contextlib.redirect_stdout(io.StringIO()):
-                    cmd_consume([d["path"], "--session", sid])
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_consume([d["path"], "--session", sid])
             except Exception:
-                auto = False
+                rc, auto = 0, False
+            if rc == 3:
+                # Another session claimed it between the scan and the claim.
+                # Offering it anyway is how both sessions end up on one lane.
+                return 0
         if not auto:
             bind_session_lane(sid, d["lane"])
         claim = ("It is already marked consumed, so nothing is needed to claim it."
@@ -607,9 +614,13 @@ def cmd_sessionstart(payload: dict) -> int:
             "plan with full confidence.\n"
             "- If the user's first message clearly matches one lane, claim it with "
             "`python3 ~/.claude/handover/bin/ctx.py pickup --lane <lane>` - that "
-            "prints the doc and marks it consumed in one call.\n"
+            "prints the doc and claims it in one call.\n"
             "- If it is ambiguous - a bare 'continue' with several lanes open - ASK "
-            "which one, listing the titles above. Never pick for them."
+            "which one, listing the titles above. Never pick for them.\n"
+            "- Do NOT open the doc with Read: a doc read without being claimed "
+            "stays on offer, and the next session is handed work you are already "
+            "doing. `pickup` is the only way in. Exit 3 means another session got "
+            "there first - pick a different lane, do not force it."
         )
     emit({
         "systemMessage": f"handover pending: {len(docs)} lane(s)",
@@ -646,7 +657,95 @@ def handover_copies(cfg: dict, cwd: str, stamp: str) -> list[Path]:
     return found
 
 
-def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48) -> list[dict]:
+# --------------------------------------------------------------- claiming ---
+# A lock this old is a killed process, not a holder. A permanent lock would be
+# a worse bug than the race it prevents.
+CLAIM_STALE_SECONDS = 90
+
+
+def claim_holder(text: str) -> dict | None:
+    """Who holds this handover, read from its own frontmatter.
+
+    `status: pending` is the only unclaimed state; anything else names a
+    holder. The doc is the lock: it is the one thing every machine and every
+    session can see, so it is where ownership has to be written.
+    """
+    m = re.search(r"^status:\s*(.+)$", text[:2000], re.M)
+    if not m:
+        return None
+    line = m.group(1).strip()
+    if line.startswith("pending"):
+        return None
+    who = re.search(r"\bby\s+(\S+)", line)
+    sm = re.search(r"^consumed_session:\s*(\S+)", text[:2000], re.M)
+    return {
+        "status": line,
+        "machine": who.group(1) if who else "?",
+        "session": sm.group(1) if sm else "",
+        "superseded": line.startswith("superseded"),
+    }
+
+
+def same_session(a: str, b: str) -> bool:
+    """Whether two session ids are the same session.
+
+    Transcript stems are full uuids but callers sometimes carry a prefix, so
+    match either way round rather than demanding equality.
+    """
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
+@contextlib.contextmanager
+def claim_lock(doc: Path):
+    """Exclusive create around the read-modify-write of the frontmatter.
+
+    Two sessions that start in the same second both read `status: pending`,
+    both believe they won, and both work the same lane - which is the exact
+    failure writing a holder into the doc exists to prevent. `O_EXCL` decides
+    it. Named `<doc>.claim` so the `HANDOVER-*.md` glob never sees it.
+
+    An unwritable directory yields unlocked rather than failing: a missing lock
+    costs a rare race, a raised exception costs the pickup.
+    """
+    lock = doc.parent / (doc.name + ".claim")
+    fd = None
+    for _ in range(40):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > CLAIM_STALE_SECONDS:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+        except OSError:
+            break
+    try:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.write(fd, f"{MACHINE} {os.getpid()} {now_iso()}\n".encode())
+            os.close(fd)
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                lock.unlink()
+
+
+def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48,
+                      include_claimed: bool = False) -> list[dict]:
+    """Handovers for this project, unclaimed ones only unless asked otherwise.
+
+    `include_claimed` is for the commands that report on ownership - `list
+    --all`, `release` - rather than for the ones that offer work. Nothing that
+    offers work may ever see a claimed doc.
+    """
     out: list[dict] = []
     seen: set[str] = set()
     dirs = [handover_dir(cwd)]
@@ -664,7 +763,8 @@ def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48) -> list[di
                 head = p.read_text(errors="replace")[:1200]
             except Exception:
                 continue
-            if re.search(r"^status:\s*(consumed|superseded)", head, re.M):
+            held = claim_holder(head)
+            if held and not include_claimed:
                 continue
             age = (time.time() - p.stat().st_mtime) / 3600.0
             if age > max_age_hours:
@@ -674,6 +774,7 @@ def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48) -> list[di
             mt = re.search(r"^handover:\s*(.+)$", head, re.M)
             seen.add(stamp)
             out.append({"path": str(p), "mtime": p.stat().st_mtime,
+                        "held": held,
                         "machine": m.group(1) if m else "?",
                         # docs written before lanes existed are all one lane
                         "lane": ml.group(1).strip() if ml else "main",
@@ -1561,13 +1662,23 @@ def cmd_list(args: list[str]) -> int:
     for i, a in enumerate(args):
         if a == "--cwd" and i + 1 < len(args):
             cwd = args[i + 1]
-    docs = pending_handovers(cfg, cwd, max_age_hours=24 * 365)
+    # Claimed docs are hidden by default for the same reason nothing offers
+    # them: what `list` answers is "what is open", not "what exists".
+    every = "--all" in args or "--claimed" in args
+    docs = pending_handovers(cfg, cwd, max_age_hours=24 * 365, include_claimed=every)
     if not docs:
-        print("no handovers for", project_slug(cwd))
+        print("no handovers for", project_slug(cwd)
+              + ("" if every else " (pending; --all includes claimed ones)"))
         return 0
     for d in docs[:20]:
         age = (time.time() - d["mtime"]) / 3600.0
-        print(f"{age:6.1f}h ago  [{d['lane']:<20}] [{d['machine']:<12}] {d['path']}")
+        h = d.get("held")
+        state = "pending"
+        if h:
+            state = ("superseded" if h["superseded"]
+                     else f"held by {h['machine']}/{(h['session'] or '?')[:8]}")
+        print(f"{age:6.1f}h ago  [{d['lane']:<20}] [{d['machine']:<12}] "
+              f"{state:<28} {d['path']}")
     return 0
 
 
@@ -1586,13 +1697,29 @@ def cmd_show(args: list[str]) -> int:
 
 
 def cmd_consume(args: list[str]) -> int:
+    """Claim a handover for this session, exclusively.
+
+    Exit 3 means another session already holds it. That is not a failure of the
+    caller - it is the answer to "is this thread mine to work on", and it is
+    the whole reason the holder is written into the doc. Before this, a claim
+    was a courtesy: `re.sub` on a doc that was no longer `pending` quietly
+    changed nothing and every caller carried on as though it had won, so two
+    agents could work the same lane while each believed it owned it.
+
+    Claiming twice from the same session is a no-op, not a refusal - a resumed
+    session must be able to re-run its own pickup.
+
+    Options: `--session <id>`, `--force` (steal a claim someone else holds).
+    """
     if not args:
-        print("usage: ctx.py consume <handover.md>", file=sys.stderr)
+        print("usage: ctx.py consume <handover.md> [--session ID] [--force]",
+              file=sys.stderr)
         return 1
     p = Path(args[0])
     if not p.exists():
         print("not found:", p, file=sys.stderr)
         return 1
+    force = "--force" in args
     txt = p.read_text()
     sid = ""
     for i, a in enumerate(args):
@@ -1602,15 +1729,18 @@ def cmd_consume(args: list[str]) -> int:
         m = re.search(r"^cwd:\s*(.+)$", txt[:2000], re.M)
         t = find_transcript((m.group(1).strip() if m else None) or os.getcwd(), None)
         sid = t.stem if t else ""
+
     def mark(doc: Path) -> bool:
         try:
             body = doc.read_text()
         except Exception:
             return False
-        out = re.sub(r"^status:\s*pending", f"status: consumed by {MACHINE} at {now_iso()}",
+        out = re.sub(r"^status:\s*.*$", f"status: consumed by {MACHINE} at {now_iso()}",
                      body, count=1, flags=re.M)
-        if sid and not re.search(r"^consumed_session:", out, re.M):
-            out = re.sub(r"^(status:.*)$", rf"\1\nconsumed_session: {sid}", out, count=1, flags=re.M)
+        out = re.sub(r"^consumed_session:.*\n", "", out, count=1, flags=re.M)
+        if sid:
+            out = re.sub(r"^(status:.*)$", rf"\1\nconsumed_session: {sid}", out,
+                         count=1, flags=re.M)
         if out == body:
             return False
         doc.write_text(out)
@@ -1627,13 +1757,105 @@ def cmd_consume(args: list[str]) -> int:
         for q in handover_copies(cfg, m_cwd.group(1).strip(), handover_stamp(p.name)):
             targets.add(q.resolve())
 
-    for doc in sorted(targets):
-        if mark(doc):
-            print("marked consumed:", doc)
+    ml = re.search(r"^lane:\s*(\S+)", txt[:2000], re.M)
+    lane = ml.group(1).strip() if ml else "main"
+
+    # One lock, taken on the copy that was named, guarding the read of the
+    # holder and the write that replaces it. Checking and then writing without
+    # it is the race in two statements.
+    with claim_lock(p):
+        held = claim_holder(p.read_text())
+        if held and same_session(held["session"], sid):
+            print(f"already yours: {p} (lane '{lane}')")
+            bind_session_lane(sid, lane)
+            return 0
+        if held and not force:
+            who = held["machine"]
+            sess = held["session"][:8] or "?"
+            print(f"HELD - {p.name} is already claimed by {who} (session {sess}) "
+                  f"at: {held['status']}", file=sys.stderr)
+            print("Leave it alone, or take it deliberately with --force "
+                  "(only when you know that session is gone).", file=sys.stderr)
+            return 3
+        for doc in sorted(targets):
+            if mark(doc):
+                print("marked consumed:", doc)
     # Pin this session to the lane it just claimed: it will not be offered a
     # different one, and any handover it writes later stays on this thread.
-    ml = re.search(r"^lane:\s*(\S+)", txt[:2000], re.M)
-    bind_session_lane(sid, ml.group(1).strip() if ml else "main")
+    bind_session_lane(sid, lane)
+    return 0
+
+
+def cmd_release(args: list[str]) -> int:
+    """Hand a claimed handover back, so another session can pick it up.
+
+    The counterpart to an exclusive claim. A session that claims a lane and
+    then dies would otherwise take the work with it - a claimed doc is
+    filtered out of every offer, so the thread becomes invisible rather than
+    merely unowned. Nothing else in the system can tell a crash from an agent
+    that is still thinking, which is why this is a deliberate command and not
+    a timeout.
+
+    Usage: `release <handover.md>` or `release --lane <lane> [--cwd DIR]`.
+    """
+    cfg = load_config()
+    cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    lane = ""
+    path = ""
+    for i, a in enumerate(args):
+        if a == "--cwd" and i + 1 < len(args):
+            cwd = args[i + 1]
+        elif a == "--lane" and i + 1 < len(args):
+            lane = lane_slug(args[i + 1])
+        elif not a.startswith("--") and (i == 0 or args[i - 1] not in ("--cwd", "--lane")):
+            path = a
+
+    if path:
+        docs = [{"path": path, "lane": lane or "?"}]
+        if not Path(path).exists():
+            print("not found:", path, file=sys.stderr)
+            return 1
+    else:
+        claimed = [d for d in pending_handovers(cfg, cwd, max_age_hours=24 * 365,
+                                                include_claimed=True)
+                   if d["held"] and not d["held"]["superseded"]]
+        if lane:
+            claimed = [d for d in claimed if d["lane"] == lane]
+        if not claimed:
+            print("nothing claimed to release for " + project_slug(cwd)
+                  + (f" lane '{lane}'" if lane else ""), file=sys.stderr)
+            return 1
+        if len(claimed) > 1 and not lane:
+            print("AMBIGUOUS - several claimed handovers. Name a lane:", file=sys.stderr)
+            for d in claimed:
+                print(f"  --lane {d['lane']:<24} {d['title']}", file=sys.stderr)
+            return 2
+        docs = claimed[:1]
+
+    d = docs[0]
+    # Release every copy, for the same reason a claim marks every copy: one
+    # released and one still held is a doc that is offered and then refused.
+    stamp = handover_stamp(Path(d["path"]).name)
+    paths = {Path(d["path"]).resolve()}
+    txt = Path(d["path"]).read_text()
+    m_cwd = re.search(r"^cwd:\s*(.+)$", txt[:2000], re.M)
+    if m_cwd:
+        for q in handover_copies(cfg, m_cwd.group(1).strip(), stamp):
+            paths.add(q.resolve())
+    freed = 0
+    for doc in sorted(paths):
+        try:
+            body = doc.read_text()
+            out = re.sub(r"^status:\s*.*$", "status: pending", body, count=1, flags=re.M)
+            out = re.sub(r"^consumed_session:.*\n", "", out, count=1, flags=re.M)
+            if out != body:
+                doc.write_text(out)
+                freed += 1
+                print("released:", doc)
+        except Exception:
+            continue
+    if not freed:
+        print("already pending:", d["path"])
     return 0
 
 
@@ -1645,11 +1867,13 @@ def cmd_pickup(args: list[str]) -> int:
     useful once it is in context anyway.
 
     Exit 2 means ambiguous: several lanes are open and the caller must ask which
-    one rather than choose.
+    one rather than choose. Exit 3 means another session got there first - the
+    doc is deliberately NOT printed then, because printing it is the pickup.
     """
     cfg = load_config()
     cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     lane = sid = ""
+    force = "--force" in args
     for i, a in enumerate(args):
         if a == "--cwd" and i + 1 < len(args):
             cwd = args[i + 1]
@@ -1680,9 +1904,14 @@ def cmd_pickup(args: list[str]) -> int:
         sid = t.stem if t else ""
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            cmd_consume([d["path"], "--session", sid])
+            rc = cmd_consume([d["path"], "--session", sid]
+                             + (["--force"] if force else []))
     except Exception:
-        pass
+        rc = 0
+    if rc == 3:
+        # Someone else holds it. Handing over the body anyway would be the
+        # same double-pickup with an extra step.
+        return 3
     print(f"# picked up lane '{d['lane']}' - {d['path']}\n")
     print(Path(d["path"]).read_text())
     return 0
@@ -1913,6 +2142,8 @@ def main(argv: list[str]) -> int:
             return cmd_show(args)
         if cmd == "consume":
             return cmd_consume(args)
+        if cmd == "release":
+            return cmd_release(args)
         if cmd == "savings":
             return cmd_savings(args)
         if cmd == "report":
