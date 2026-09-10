@@ -121,7 +121,8 @@ If this session picked up a handover, it is already bound to that lane and keeps
 automatically; pass `--lane` only to start a genuinely new thread.
 
 This stamps machine, session, branch, model and context size onto the doc, saves it to
-`<project>/.claude/handover/HANDOVER-<timestamp>.md`, updates `LATEST.md`, mirrors it to
+`<project>/.claude/handover/HANDOVER-<timestamp>.md`, updates `LATEST-<lane>.md` (and the
+bare `LATEST.md`, an alias for whichever lane wrote last), mirrors it to
 the shared folder if one is configured (so another computer can pick it up), and copies the
 start-here prompt to the clipboard as a fallback — the next session will not need it, since
 SessionStart hands itself the doc.

@@ -11,6 +11,7 @@ Subcommands:
   statusline    statusLine command - stdin JSON -> one status line
   status        human-readable context reading for the current session
   facts         extract hard facts from a transcript for a handover doc
+  brief         status + facts in one call - what a handover is written from
   write         finalise a handover doc (adds metadata, mirrors, clipboard)
   list          list recent handovers (all machines, if a share dir is set)
   show          print a handover doc
@@ -26,6 +27,7 @@ Subcommands:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -37,7 +39,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 VERSION = "1.5.0"
@@ -88,6 +90,8 @@ DEFAULT_CONFIG = {
         "branch": "main",
         "source": "",                # override the base URL: a fork, a mirror, or file:// in a test
         "timeout_seconds": 10,
+        "retry_after_failure_hours": 1,   # a 503 must not cost the whole daily slot
+        "allow_drifted": False,      # true = overwrite local edits without asking
     },
     "projection_turns": 20,   # turns the session would plausibly have continued
     "pricing": {
@@ -572,6 +576,37 @@ def check_update(cfg: dict) -> dict:
             "source": src, "text": text}
 
 
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def drifted_files(cfg: dict, timeout: float, prefetched: dict | None = None) -> list[str]:
+    """Installed files that differ from the *published file of the same version*.
+
+    A hand-patch applied to the install and never committed leaves the machine on
+    a same-version fork, which `check_update` cannot see: it compares the VERSION
+    string, and a local edit does not change it. Overwriting that silently is how
+    a fix gets un-fixed. It happened once - the LATEST.md symlink guard - so the
+    updater now looks at content, not just the version.
+
+    Only meaningful when local and remote versions match; a genuine upgrade is
+    expected to differ everywhere.
+    """
+    out = []
+    for item in remote_manifest(cfg, timeout):
+        dest = resolve_dest(item["dest"])
+        if dest is None or not dest.exists():
+            continue
+        try:
+            published = (prefetched or {}).get(item["src"]) \
+                or fetch_text(update_source(cfg) + item["src"], timeout)
+        except Exception:
+            continue          # unreachable file is the fetcher's problem, not drift
+        if sha256_text(dest.read_text()) != sha256_text(published):
+            out.append(item["dest"])
+    return out
+
+
 def remote_manifest(cfg: dict, timeout: float) -> list[dict]:
     """The published file list, so a later release can add a file this version
     has never heard of. Falls back to what this version knows."""
@@ -610,10 +645,26 @@ def apply_update(cfg: dict, force: bool = False) -> dict:
         if not won:
             return {"status": "busy"}
         info = check_update(cfg)
+        same_version = parse_version(info["remote"]) == parse_version(VERSION)
+
+        # Drift is a same-version disagreement between what is installed and what
+        # is published - a hand-patch that was never committed. `check_update`
+        # cannot see it, because a local edit does not change the VERSION string.
+        # Look before returning "current", or the one moment the machine could
+        # have been told is the moment it says everything is fine.
+        drift = []
+        if same_version and not ucfg.get("allow_drifted", False):
+            drift = drifted_files(cfg, timeout, {"bin/ctx.py": info["text"]})
+
         if not info["newer"] and not force:
-            return {"status": "current", "local": VERSION, "to": info["remote"]}
+            return {"status": "drifted" if drift else "current",
+                    "local": VERSION, "to": info["remote"], "files": drift,
+                    "at_version": VERSION}
         if not force and info["remote"] == (load_update_state().get("skip_version") or ""):
             return {"status": "skipped", "to": info["remote"]}
+        # `--force` at the same version is how you deliberately discard a local edit.
+        if drift and not force:
+            return {"status": "drifted", "files": drift, "at_version": VERSION}
 
         # Fetch and validate everything before touching a single installed file:
         # a half-applied update is a broken install, and the thing being
@@ -631,6 +682,13 @@ def apply_update(cfg: dict, force: bool = False) -> dict:
                 compile(text, item["src"], "exec")   # never install a file that will not parse
             elif len(text.strip()) < 200:
                 return {"status": "error", "error": f"{item['src']} looks truncated"}
+            # An optional sha256 in the manifest pins the bytes. The manifest and
+            # the files come down the same channel, so this is a corruption and
+            # truncation check, not a defence against a hostile publisher.
+            want = (item.get("sha256") or "").strip().lower()
+            if want and sha256_text(text) != want:
+                return {"status": "error",
+                        "error": f"{item['src']} does not match its manifest sha256"}
             staged.append((item, dest, text))
 
         bdir = ROOT / "backup" / VERSION
@@ -663,6 +721,11 @@ def apply_update(cfg: dict, force: bool = False) -> dict:
             pass
         st = load_update_state()
         st.pop("skip_version", None)
+        # What rollback pins away from. Reading it back off the `notice` was a bug:
+        # a failed check overwrites `notice` with an object that has no `to`, and
+        # rollback then pinned to "" and cheerfully reinstalled the bad version.
+        st["applied_version"] = info["remote"]
+        st["applied_from"] = VERSION
         save_update_state(st)
         return {"status": "updated", "from": VERSION, "to": info["remote"],
                 "note": info["note"], "source": info["source"], "hooks_rewired": rewired}
@@ -681,6 +744,24 @@ def record_notice(kind: str, **fields) -> None:
     notice["at"] = now_iso()
     st["notice"] = notice
     save_update_state(st)
+
+
+def clear_notice(kinds: tuple = ("failed", "drifted")) -> None:
+    """Retire a notice the latest check has disproved, emitting nothing.
+
+    A check that succeeded has to retire the failure before it. It did not, so
+    one 503 kept injecting "the update check failed" into every new session for
+    as long as no release happened along to overwrite it.
+
+    Only complaints are cleared. An `available` notice describes a version that
+    is still published and still not installed, so a clean check does not
+    disprove it - it confirms it."""
+    st = load_update_state()
+    n = st.get("notice") or {}
+    if n and n.get("kind") in kinds:
+        st["notice"] = None
+        st["notified"] = []
+        save_update_state(st)
 
 
 def update_rollback(quiet: bool = False) -> int:
@@ -706,9 +787,12 @@ def update_rollback(quiet: bool = False) -> int:
         restored += 1
     st = load_update_state()
     # Without this the next daily check would cheerfully reinstall the version
-    # you just backed out of.
-    st["skip_version"] = st.get("notice", {}).get("to") or ""
+    # you just backed out of. Read it from what the apply recorded, not from
+    # `notice`, which any later failed check overwrites with a shape that has
+    # no version in it at all.
+    st["skip_version"] = st.get("applied_version") or (st.get("notice") or {}).get("to") or ""
     st["notice"] = None
+    st.pop("applied_version", None)
     save_update_state(st)
     if not quiet:
         print(f"rolled back to {b.name} ({restored} file(s))")
@@ -730,10 +814,20 @@ def maybe_spawn_update_check(cfg: dict) -> None:
     if every <= 0:
         return
     st = load_update_state()
-    if time.time() - float(st.get("last_check") or 0) < every * 3600:
+    now = time.time()
+    # The slot is claimed before the network so that ten sessions waking at once
+    # start one check, not ten. The cost of that is a failure holding the slot
+    # for a whole day, so a failed check writes a nearer `next_check_at` and this
+    # honours whichever comes first.
+    due = float(st.get("last_check") or 0) + every * 3600
+    retry_at = float(st.get("next_check_at") or 0)
+    if retry_at:
+        due = min(due, retry_at)
+    if now < due:
         return
-    st["last_check"] = time.time()          # claim the slot before the network, not after
+    st["last_check"] = now
     st["last_check_iso"] = now_iso()
+    st.pop("next_check_at", None)
     save_update_state(st)
     with contextlib.suppress(Exception):
         subprocess.Popen(
@@ -760,10 +854,43 @@ UPDATE_TEXT = {
     ),
     "failed": (
         "HANDOVER TOOLKIT - the daily update check failed: {error}\n"
-        "Nothing changed and the tool works exactly as before; the next check is in a day. "
+        "Nothing changed and the tool works exactly as before; it retries on its own. "
         "Mention it in one line - once - and carry on. Do not debug it unless the user asks."
     ),
+    "drifted": (
+        "HANDOVER TOOLKIT - this machine's install has been edited by hand and no longer "
+        "matches published {frm}: {files}.\n"
+        "The updater refused to overwrite it, so nothing was lost and nothing changed. "
+        "But the edit only exists here: the next release replaces these files and the change "
+        "goes with it. Tell the user in one line that the edit needs committing to the "
+        "toolkit repo (or `update --force` to discard it). Do not do either unless they ask."
+    ),
 }
+
+
+def record_failure(error: str, cfg: dict) -> None:
+    """A failure notice plus a nearer retry, doubling up to the normal interval.
+
+    Without the retry a single transient 503 bought a full day of no checks."""
+    ucfg = update_cfg(cfg)
+    every_s = float(ucfg.get("check_every_hours", 24) or 24) * 3600
+    base = float(ucfg.get("retry_after_failure_hours", 1) or 1) * 3600
+    st = load_update_state()
+    prev = float(st.get("retry_backoff") or 0)
+    wait = min(max(base, prev * 2), every_s)
+    record_notice("failed", error=error)
+    st = load_update_state()               # record_notice rewrote it
+    st["retry_backoff"] = wait
+    st["next_check_at"] = time.time() + wait
+    save_update_state(st)
+
+
+def clear_failure_backoff() -> None:
+    st = load_update_state()
+    if st.get("retry_backoff") or st.get("next_check_at"):
+        st.pop("retry_backoff", None)
+        st.pop("next_check_at", None)
+        save_update_state(st)
 
 
 def update_notice(sid: str, cfg: dict) -> tuple[str, str] | None:
@@ -785,10 +912,12 @@ def update_notice(sid: str, cfg: dict) -> tuple[str, str] | None:
     body = UPDATE_TEXT[n["kind"]].format(
         frm=n.get("frm", "?"), to=n.get("to", "?"), at=n.get("at", ""),
         source=n.get("source", "github"), error=n.get("error", "unknown"),
+        files=n.get("files", "?"),
         note=(f"What changed: {note}\n" if note else ""))
     head = {
         "updated": f"handover toolkit updated {n.get('frm','?')} -> {n.get('to','?')}",
         "available": f"handover toolkit {n.get('to','?')} available (you have {n.get('frm','?')})",
+        "drifted": f"handover toolkit: local edits to {n.get('files','?')} are not committed",
         "failed": "handover toolkit: update check failed",
     }[n["kind"]]
     return head, body
@@ -836,6 +965,15 @@ def cmd_update(args: list[str]) -> int:
                   + ("UPDATE AVAILABLE" if info["newer"] else "up to date"))
             if info["newer"] and info["note"]:
                 print(f"note: {info['note']}")
+            if not info["newer"]:
+                drift = drifted_files(cfg, float(ucfg.get("timeout_seconds", 10)),
+                                      {"bin/ctx.py": info["text"]})
+                if drift:
+                    print("LOCAL EDITS not in published " + VERSION + ": " + ", ".join(drift))
+                    print("commit them to the toolkit repo, or `update --force` to discard")
+                else:
+                    clear_notice()
+            clear_failure_backoff()
             return 0
         if not ucfg.get("auto_apply", True) and not force:
             info = check_update(cfg)
@@ -845,17 +983,21 @@ def cmd_update(args: list[str]) -> int:
                 if not quiet:
                     print(f"{info['remote']} available (auto_apply is off) - "
                           "install it with: update --force")
-            elif not quiet:
-                print(f"up to date ({VERSION})")
+            else:
+                clear_notice()
+                if not quiet:
+                    print(f"up to date ({VERSION})")
+            clear_failure_backoff()
             return 0
         res = apply_update(cfg, force=force)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         if background:
-            record_notice("failed", error=err)
+            record_failure(err, cfg)
             return 0
         print(f"update failed: {err}", file=sys.stderr)
         return 1
+    clear_failure_backoff()      # the network answered; stop retrying early
 
     status = res.get("status")
     if status == "updated":
@@ -868,7 +1010,19 @@ def cmd_update(args: list[str]) -> int:
             if res.get("hooks_rewired"):
                 print("hooks re-wired in settings.json")
         return 0
+    if status == "drifted":
+        files = ", ".join(res.get("files") or []) or "?"
+        record_notice("drifted", frm=res.get("at_version", VERSION), files=files)
+        if not quiet:
+            print(f"refused: {files} edited locally and not in published "
+                  f"{res.get('at_version', VERSION)}")
+            print("commit them to the toolkit repo, or `update --force` to discard")
+        return 0
     if status in ("current", "busy", "skipped"):
+        # A check that got an answer retires whatever the last one complained
+        # about. "busy" is not an answer - another process holds the lock.
+        if status != "busy":
+            clear_notice()
         if not quiet:
             print({"current": f"up to date ({VERSION})",
                    "busy": "another update is already running",
@@ -876,7 +1030,7 @@ def cmd_update(args: list[str]) -> int:
                               " - `update --force` installs it again"}[status])
         return 0
     if background:
-        record_notice("failed", error=res.get("error", "unknown"))
+        record_failure(res.get("error", "unknown"), cfg)
         return 0
     print(f"update failed: {res.get('error', 'unknown')}", file=sys.stderr)
     return 1
@@ -1173,7 +1327,8 @@ def handover_stamp(name: str) -> str:
     how a project accumulates a queue that never drains: consuming either copy
     left the other pending, so the next session was offered it all over again.
     """
-    m = re.match(r"HANDOVER-(\d{8}-\d{4})", name)
+    # Seconds since 1.6.0; the four-digit form is every doc written before it.
+    m = re.match(r"HANDOVER-(\d{8}-\d{6}|\d{8}-\d{4})", name)
     return m.group(1) if m else name
 
 
@@ -1740,7 +1895,9 @@ def render_savings(sv: dict) -> str:
 # --all` answers the other question: what did the handovers already written
 # actually save, measured against the sessions that picked them up.
 
-HANDOVER_RE = re.compile(rb"HANDOVER-\d{8}-\d{4}")
+# Seconds first, so a 1.6.0 filename is not truncated to its minute -- these ids
+# are matched against the ones parse_handover() derives, and the two must agree.
+HANDOVER_RE = re.compile(rb"HANDOVER-(?:\d{8}-\d{6}|\d{8}-\d{4})")
 
 
 def parse_handover(path: Path) -> dict | None:
@@ -1760,7 +1917,7 @@ def parse_handover(path: Path) -> dict | None:
         return None
     if ctx <= 0:
         return None
-    stem = re.match(r"HANDOVER-\d{8}-\d{4}", path.stem)
+    stem = re.match(r"HANDOVER-(?:\d{8}-\d{6}|\d{8}-\d{4})", path.stem)
     return {"path": path, "name": path.stem, "id": stem.group(0) if stem else path.stem,
             "project": fm.get("project") or path.parent.name,
             "session": fm.get("session", ""), "model": fm.get("model", ""),
@@ -2055,6 +2212,38 @@ status: pending
 """
 
 
+def write_regular(path: Path, text: str) -> None:
+    """Write a plain file, replacing a symlink rather than following it.
+
+    write_text() opens 'w', which follows a symlink and truncates its target: a
+    LATEST.md someone had turned into a link silently destroyed the handover it
+    aliased, on every write."""
+    if path.is_symlink():
+        path.unlink()
+    path.write_text(text)
+
+
+def claim_handover_path(d: Path, when: datetime) -> tuple[Path, str]:
+    """Create an empty handover file nobody else holds, and return it + its stamp.
+
+    The stamp used to be minute-resolution and the write a bare write_text(), so
+    two sessions in one repo finishing inside the same minute produced the same
+    path and the second erased the first - the precise case lanes exist to
+    support. Seconds plus O_EXCL fixes the filename; walking forward a second on
+    collision also keeps the stamp itself unique, which matters because the stamp
+    is the identity that pairs a doc with its mirror.
+    """
+    for bump in range(180):
+        stamp = (when + timedelta(seconds=bump)).strftime("%Y%m%d-%H%M%S")
+        p = d / f"HANDOVER-{stamp}.md"
+        try:
+            os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            return p, stamp
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not claim a free handover filename in {d}")
+
+
 def cmd_write(args: list[str]) -> int:
     cfg = load_config()
     body_file = None
@@ -2095,7 +2284,8 @@ def cmd_write(args: list[str]) -> int:
     if not lane:
         lane = session_lane(_sid) or lane_slug(title)
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    d = handover_dir(cwd)
+    out, stamp = claim_handover_path(d, datetime.now())
     doc = FRONTMATTER.format(
         title=title, project=project_slug(cwd), lane=lane, cwd=cwd,
         branch=info.get("git_branch") or "-", machine=MACHINE,
@@ -2103,16 +2293,13 @@ def cmd_write(args: list[str]) -> int:
         tokens=info.get("tokens", 0), when=now_iso(),
     ) + body.strip() + "\n"
 
-    d = handover_dir(cwd)
-    out = d / f"HANDOVER-{stamp}.md"
     out.write_text(doc)
-    # LATEST.md must be a regular file. write_text() opens 'w', which follows a
-    # symlink and truncates its target -- a symlinked LATEST.md silently destroys
-    # the handover it points at, on every write. Unlink first.
-    latest = d / "LATEST.md"
-    if latest.is_symlink():
-        latest.unlink()
-    latest.write_text(doc)
+    # LATEST is per-lane. As one file per directory, two concurrent lanes
+    # overwrote each other's and the bare name pointed at whichever finished
+    # last, which is not the same thing as "the latest doc for the work you are
+    # doing". Keep the unsuffixed name as an alias for the newest lane.
+    write_regular(d / f"LATEST-{lane}.md", doc)
+    write_regular(d / "LATEST.md", doc)
     written = [str(out)]
 
     sd = share_dir(cfg)
@@ -2120,7 +2307,7 @@ def cmd_write(args: list[str]) -> int:
         sub = sd / project_slug(cwd)
         sub.mkdir(parents=True, exist_ok=True)
         mirror = sub / f"HANDOVER-{stamp}-{MACHINE}.md"
-        mirror.write_text(doc)
+        write_regular(mirror, doc)
         written.append(str(mirror))
 
     # Everything this doc replaces is finished with by definition.
@@ -2132,8 +2319,9 @@ def cmd_write(args: list[str]) -> int:
     if m:
         prompt = m.group(1).strip()
     if prompt:
-        (d / "PROMPT.txt").write_text(prompt + "\n")
-        written.append(str(d / "PROMPT.txt"))
+        write_regular(d / f"PROMPT-{lane}.txt", prompt + "\n")
+        write_regular(d / "PROMPT.txt", prompt + "\n")
+        written.append(str(d / f"PROMPT-{lane}.txt"))
         if cfg.get("clipboard", True) and sys.platform == "darwin":
             try:
                 subprocess.run(["pbcopy"], input=prompt.encode(), timeout=5)

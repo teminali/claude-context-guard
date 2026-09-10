@@ -26,6 +26,8 @@
     "repo": "teminali/claude-context-guard",
     "branch": "main",
     "source": "",
-    "timeout_seconds": 10
+    "timeout_seconds": 10,
+    "retry_after_failure_hours": 1,
+    "allow_drifted": false
   }
 }

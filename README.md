@@ -151,12 +151,20 @@ Nobody remembers. So it fetches its own updates:
   nothing on that path ever touches the network. The check is one small file read, and
   at most once a day, one `Popen`.
 - **Validated before it lands.** Every file is fetched and checked first — the new
-  `ctx.py` must parse (`compile()`) and look like a whole file — and only then are the
-  installed copies replaced, atomically, with `os.replace`. A half-applied update would
-  break the very code that has to explain itself.
+  `ctx.py` must parse (`compile()`), look like a whole file, and match its `sha256` if the
+  manifest carries one — and only then are the installed copies replaced, atomically, with
+  `os.replace`. A half-applied update would break the very code that has to explain itself.
+- **Refuses to overwrite your edits.** If an installed file differs from the published file
+  *of the same version*, you have hand-patched this machine and never committed it. The
+  version string cannot see that, so the updater compares content: it stops, names the file,
+  and changes nothing. Commit the edit upstream, or `update --force` to discard it. (This is
+  not hypothetical — a `LATEST.md` fix lived only on one machine for three days.)
 - **Backed up.** The version it replaced goes to `backup/<version>/`; `update --rollback`
   restores it and pins you there, so the next day's check does not cheerfully reinstall
   what you just backed out of. `update --force` un-pins it.
+- **Backs off on failure.** A check that cannot reach the network retries in an hour,
+  doubling up to the normal interval, rather than spending the whole day's single slot on
+  one 503. A check that succeeds retires the failure notice the last one left behind.
 - **Announced.** The next prompt in *every* open session gets one line: what version
   landed and what changed. Once per session, never twice.
 - **Hook-aware.** If a release adds or renames a hook, it re-wires `settings.json` —
@@ -188,7 +196,9 @@ Tune or disable it in `config.json`:
   "repo": "teminali/claude-context-guard",
   "branch": "main",
   "source": "",             // a fork, a mirror, or file:///... in a test
-  "timeout_seconds": 10
+  "timeout_seconds": 10,
+  "retry_after_failure_hours": 1,  // doubles, capped at check_every_hours
+  "allow_drifted": false    // true: overwrite local edits without stopping
 }
 ```
 
