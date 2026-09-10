@@ -2106,7 +2106,13 @@ def cmd_write(args: list[str]) -> int:
     d = handover_dir(cwd)
     out = d / f"HANDOVER-{stamp}.md"
     out.write_text(doc)
-    (d / "LATEST.md").write_text(doc)
+    # LATEST.md must be a regular file. write_text() opens 'w', which follows a
+    # symlink and truncates its target -- a symlinked LATEST.md silently destroys
+    # the handover it points at, on every write. Unlink first.
+    latest = d / "LATEST.md"
+    if latest.is_symlink():
+        latest.unlink()
+    latest.write_text(doc)
     written = [str(out)]
 
     sd = share_dir(cfg)
