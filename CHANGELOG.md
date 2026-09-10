@@ -2,6 +2,10 @@
 
 Every entry's one-line note is what installed sessions are shown when they update.
 
+## 1.6.0 - 2026-09-10
+
+refuses to overwrite local edits, and two sessions in one repo can no longer overwrite each other's handover
+
 ## 1.5.0 - 2026-09-04
 
 checks GitHub once a day and updates itself, then tells you what changed

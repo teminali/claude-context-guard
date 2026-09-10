@@ -42,9 +42,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 # One line, shown to every session the update reaches. Say what changed, not what it is.
-UPDATE_NOTE = "checks GitHub once a day and updates itself, then tells you what changed"
+UPDATE_NOTE = "refuses to overwrite local edits, and two sessions in one repo can no longer overwrite each other's handover"
 HOME = Path.home()
 ROOT = Path(os.environ.get("CLAUDE_HANDOVER_ROOT", str(HOME / ".claude" / "handover")))
 # ~/.claude, or the sandbox parent when CLAUDE_HANDOVER_ROOT is overridden - the skill
